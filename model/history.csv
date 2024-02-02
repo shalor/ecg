@@ -1,0 +1,3 @@
+epoch,train_loss,valid_loss,lr,weighted_rmse,weighted_mae,rmse,mse
+0.0,643.8420915911274,2925067.3415841586,0.001,,,,
+1.0,537.4658500671387,2058027281.7425742,0.001,,,,
