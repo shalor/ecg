@@ -1,11 +1,13 @@
 import torch
+import math
+import numpy as np
 from binarynet import ConvLayer_bin, FCLayer_bin
 import warnings
 warnings.filterwarnings("ignore")
 
-TOPK = (1,5)
+TOPK = [5]
 
-def accuracy(output, target, correct_sum, topk=(1,)):
+def accuracy(output, target, correct_sum, topk=(1,), epoch=-1, results_dic={}):
     """Compute the accuracy over the k top predictions for the specified values of k."""
     with torch.no_grad():
         maxk = max(topk)
@@ -15,6 +17,9 @@ def accuracy(output, target, correct_sum, topk=(1,)):
 
         for (i,k) in enumerate(topk):
             correct_sum[i] += (correct[:k].contiguous().view(-1).float().sum(0, keepdim=True)).item()
+        if epoch > 0:
+            results_dic["Epoch{} target".format(epoch)].append(target.tolist())
+            results_dic["Epoch{} pred".format(epoch)].append(pred.tolist())
         return 
 
 
@@ -34,18 +39,35 @@ def get_accuracy(net, train_loader, loss_func):
             total += labels.size(0)
             train_loss += loss.data.item()
             num_batches += 1
-        print('training loss: ', train_loss/num_batches)
+        print('training loss:     ', train_loss/num_batches)
         print('training accuracy: ', [ci/total for ci in correct_sum])
 
 
-def train_fullprecision(net, train_loader, loss_func, optimizer, epoch):
+def train_fullprecision(net, train_loader, loss_func, optimizer, epoch, agent, agents, trustworthy_agents, attack=False, attack_type="no_attack", attacking_agent=[0]):
     """Train the original full precision network for one epoch."""
     net.train()
     train_loss = 0.
     num_batches = 0
     correct_sum = [0. for i in range(len(TOPK))]
     total = 0
+    iterations_stop = 5;#len(train_loader)-2;#5
+    train_loader_size = len(train_loader)
+    if trustworthy_agents == agents:
+        #selected_iters = np.random.choice(math.floor(train_loader_size)-1,iterations_stop,replace=False)
+        selected_iters = np.random.choice(math.floor(train_loader_size/agents)-1,iterations_stop,replace=False) + math.floor(agent*train_loader_size/agents)
+    else:
+        selected_iters = np.random.choice(math.floor(train_loader_size/(agents-1))-1,iterations_stop,replace=False) + math.floor((agent-1)*train_loader_size/(agents-1))
     for (inputs, labels) in train_loader:               
+        num_batches += 1
+        if (num_batches not in selected_iters) and (agent not in attacking_agent):
+            continue
+        if attack and agents==trustworthy_agents:
+            if attack_type == "ConstantOutput":
+                attacker_output = 5
+                previous_labels = labels
+                labels = torch.ones(labels.size()) * attacker_output
+                labels = labels.type_as(previous_labels)
+
         inputs, labels = inputs.cuda(non_blocking=True), labels.cuda(non_blocking=True)
         optimizer.zero_grad()    
         outputs = net(inputs)
@@ -55,9 +77,9 @@ def train_fullprecision(net, train_loader, loss_func, optimizer, epoch):
         accuracy(outputs, labels, correct_sum, topk=TOPK)
         total += labels.size(0)
         train_loss += loss.data.item()
-        num_batches += 1
-    print("epoch: ", epoch, ", training loss: ", train_loss/num_batches)            
-    print('training accuracy: ', [ci/total for ci in correct_sum])
+    #print("epoch:             ", epoch)            
+    #print("training loss:     ", train_loss/num_batches)            
+    #print('training accuracy: ', [ci/total for ci in correct_sum])
 
 
 def train_coordinate(net, train_loader, loss_func, optimizer_w, optimizer_b, parameters_w_bin, epoch):
@@ -80,7 +102,8 @@ def train_coordinate(net, train_loader, loss_func, optimizer_w, optimizer_b, par
         total += labels.size(0)
         train_loss += loss.data.item()
         num_batches += 1    
-    print("epoch: ", epoch, ", training loss: ", train_loss/num_batches) 
+    print("epoch:             ", epoch)            
+    print("training loss:     ", train_loss/num_batches)            
     print('training accuracy: ', [ci/total for ci in correct_sum])
  
   
@@ -104,7 +127,8 @@ def train_basis(net, train_loader, loss_func, optimizer_w, optimizer_b, paramete
         total += labels.size(0)
         train_loss += loss.data.item()
         num_batches += 1   
-    print("epoch: ", epoch, ", training loss: ", train_loss/num_batches)                
+    print("epoch:             ", epoch)            
+    print("training loss:     ", train_loss/num_batches)            
     print('training accuracy: ', [ci/total for ci in correct_sum])
 
 
@@ -128,7 +152,8 @@ def train_basis_STE(net, train_loader, loss_func, optimizer_w, optimizer_b, para
         total += labels.size(0)
         train_loss += loss.data.item()
         num_batches += 1    
-    print("epoch: ", epoch, ", training loss: ", train_loss/num_batches)                
+    print("epoch:             ", epoch)            
+    print("training loss:     ", train_loss/num_batches)            
     print('training accuracy: ', [ci/total for ci in correct_sum])
 
 
@@ -152,7 +177,8 @@ def prune(net, train_loader, loss_func, optimizer_w, optimizer_b, parameters_w_b
         train_loss += loss.data.item()
         num_batches += 1
         total += labels.size(0)
-    print("epoch: ", epoch, ", pruning loss: ", train_loss/num_batches)                
+    print("epoch:             ", epoch)            
+    print("training loss:     ", train_loss/num_batches)            
     print('pruning accuracy: ', [ci/total for ci in correct_sum])
     num_weight_layer = 0.
     num_bit_layer = 0.
@@ -211,7 +237,7 @@ def initialize(net, train_loader, loss_func, structure, num_subchannel, max_bit)
         total += labels.size(0)
         train_loss += loss.data.item()
         num_batches += 1
-    print('train loss: ', train_loss/num_batches)
+    print("training loss:     ", train_loss/num_batches)            
     print('train accuracy: ', [ci/total for ci in correct_sum]) 
     num_weight_layer = 0.
     num_bit_layer = 0.
@@ -228,45 +254,57 @@ def initialize(net, train_loader, loss_func, structure, num_subchannel, max_bit)
     return parameters_w, parameters_b, parameters_w_bin 
       
      
-def validate(net, val_loader, loss_func):
+def validate(net, val_loader, loss_func, epoch, results_dic):
     """Get the validation loss and validation accuracy."""
     net.eval()
     val_loss = 0.
     num_batches = 0
     correct_sum = [0. for i in range(len(TOPK))]
     total = 0
+    if epoch > 0:
+        results_dic["Epoch{} target".format(epoch)] = []
+        results_dic["Epoch{} pred".format(epoch)] = []
     with torch.no_grad():
         for (inputs, labels) in val_loader:
             inputs, labels = inputs.cuda(non_blocking=True), labels.cuda(non_blocking=True)
+            net.to('cuda:0')
             outputs = net(inputs)
             loss = loss_func(outputs, labels)  
-            accuracy(outputs, labels, correct_sum, topk=TOPK)
+            accuracy(outputs, labels, correct_sum, TOPK, epoch, results_dic)
             total += labels.size(0)
             val_loss += loss.data.item()
             num_batches += 1 
-        print('validation loss: ', val_loss/num_batches)
-        print("validation accuracy: ", [ci/total for ci in correct_sum])
+        #print('validation loss: ', val_loss/num_batches)
+        #print("validation accuracy: ", [ci/total for ci in correct_sum])
+        #for ci in correct_sum:
+        #    print("Accuracy: {} / {}".format(ci,total))
+        #print("Val Acc: {} ({}/{})".format(correct_sum[0]/total,correct_sum[0],total))
         return [ci/total for ci in correct_sum]
 
 
-def test(net, test_loader, loss_func):
+def test(net, test_loader, loss_func, epoch, results_dic):
     """Get the test loss and test accuracy."""
     net.eval()
     test_loss = 0.
     num_batches = 0
     correct_sum = [0. for i in range(len(TOPK))]
     total = 0
+    if epoch > 0:
+        results_dic["Epoch{} target".format(epoch)] = []
+        results_dic["Epoch{} pred".format(epoch)] = []
     with torch.no_grad():
         for (inputs, labels) in test_loader:
             inputs, labels = inputs.cuda(non_blocking=True), labels.cuda(non_blocking=True)
             outputs = net(inputs)
             loss = loss_func(outputs, labels)  
-            accuracy(outputs, labels, correct_sum, topk=TOPK)
+            accuracy(outputs, labels, correct_sum, TOPK, epoch, results_dic)
             total += labels.size(0)
             test_loss += loss.data.item()
             num_batches += 1
-        print("test loss: ", test_loss/num_batches)
+        #print("test loss: ", test_loss/num_batches)
         print("test accuracy: ", [ci/total for ci in correct_sum])
+        for ci in correct_sum:
+            print("Accuracy: {} / {}".format(ci,total))
         
 
 def save_model(file_name, net, optimizer_w, optimizer_b, parameters_w_bin):
@@ -282,7 +320,7 @@ def save_model(file_name, net, optimizer_w, optimizer_b, parameters_w_bin):
 
 def save_model_ori(file_name, net, optimizer):
     """Save the state dictionary of model and optimizer for full precision training."""
-    print('saving...')   
+    #print('saving...')   
     torch.save({
         'net_state_dict': net.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),

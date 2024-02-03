@@ -1,5 +1,7 @@
+from __future__ import print_function
 import argparse
 import os
+import json
 import scipy.io as scio
 from sklearn.model_selection import train_test_split
 import torch
@@ -21,7 +23,13 @@ in_channels_ = 1
 num_segments_in_record = 100
 segment_len = 3600   # 3600 采样
 num_classes = 17
+layers_of_interest = [0,3,6,9,12,15,18]
+classifier_layers_of_interest = [0,3]
+cleared_models = False
 
+dic = {}
+results_dic = {}
+model_prefix = "_experiment_"
 
 def normalization(data):
     _range = np.max(data) - np.min(data)
@@ -214,7 +222,7 @@ if __name__ == "__main__":
                         help='ECG dataset directory')
     parser.add_argument('--val_size', type=int, default=200,
                         help='the number of samples in validation dataset')
-    parser.add_argument('--model_ori', type=str, default='./ECGNet_model_ori.pth',
+    parser.add_argument('--model_ori', type=str, default='ECGNet_model_ori.pth',
                         help='the file of the original full precision ECGNet model')
     parser.add_argument('--model', type=str, default='./ECGNet_model.pth',
                         help='the file of the quantized ECGNet model')
@@ -224,6 +232,10 @@ if __name__ == "__main__":
                         help='adaptive loss-aware quantize ECGNet model')       # ALQ
     parser.add_argument('--POSTTRAIN', action='store_true',
                         help='posttrain the final quantized ECGNet model')
+    parser.add_argument('--epochs', type=int, default=50,
+                        help='epochs')
+    parser.add_argument('--agents', type=int, default=1,
+                        help='agents')
     parser.add_argument('--lr', type=float, default=3e-4,
                         help='learning rate')
     parser.add_argument('--R', type=int, default=15,
@@ -254,7 +266,22 @@ if __name__ == "__main__":
                         help='the maximum bitwidth used in initialization')
     parser.add_argument('--batch_size', type=int, default=16,
                         help='the number of training samples in each batch')
+    parser.add_argument('--output_dir', type=str, default='results_dir/',
+                        help='the results directory')
+    parser.add_argument('--results_file', type=str, default='default',
+                        help='result file name')
+    parser.add_argument('--experiments', type=int, default=1,
+                        help='amount of experiments to run')
+    parser.add_argument('--experiment_start', type=int, default=1,
+                        help='amount of experiments to run')
+    parser.add_argument('--attack_type', type=str, default='no_attack',
+                        help='Attack type = ConstantOutput / LabelFlip')
+    parser.add_argument('--allow_detection', action='store_true', default=False,
+                        help='allow_detection')  # 全精度
     args = parser.parse_args()
+
+    if not os.path.exists(args.output_dir):
+        os.mkdir(args.output_dir)
 
     # Prepare Dataset
     batch_size = 16
@@ -275,188 +302,283 @@ if __name__ == "__main__":
                             batch_size=batch_size,
                             shuffle=True,
                             num_workers=0)
-    # 全精度 FULL
-    if args.PRETRAIN:
-        print('pretraining...')
+
+    attack = False
+    attacking_agent = [-1]
+    if args.attack_type != "no_attack":
+        attack = True
+        attacking_agent = [0]
+
+    #if args.PRETRAIN:
+    for num_exp in range(args.experiment_start,args.experiments+1):
+        print("###############################################") 
+        print("Running experiment {} out of {}".format(num_exp,args.experiments))
+        print("###############################################")
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         net = ECGNet().to(device)
-        from torchsummary import summary
-        summary(net, input_size=(1, 3600))
+        for agent in range(args.agents):
+            dic["model{}".format(agent)] = ECGNet().to(device)
+        #from torchsummary import summary
+        #summary(net, input_size=(1, 3600))
 
         # Construct Loss and Optimizer
         loss_func = torch.nn.CrossEntropyLoss().cuda()
         #optimizer = torch.optim.SGD(net.parameters(), lr=5e-2, momentum=0.5)
-        optimizer = optim.Adam(net.parameters(
-        ), lr=3e-4, betas=(0.9, 0.999), eps=1e-08, weight_decay=0.0, amsgrad=False)
+        optimizer = optim.Adam(net.parameters(), lr=3e-4, betas=(0.9, 0.999), eps=1e-08, weight_decay=0.0, amsgrad=False)
+        for agent in range(args.agents):
+            dic["optimizer{}".format(agent)] = optim.Adam(dic["model{}".format(agent)].parameters(), lr=3e-4, betas=(0.9, 0.999), eps=1e-08, weight_decay=0.0, amsgrad=False)
 
-        get_accuracy(net, train_loader, loss_func)
-        val_accuracy = validate(net, val_loader, loss_func)
-        best_acc = val_accuracy[0]
-        test(net, test_loader, loss_func)
-        save_model_ori(args.model_ori, net, optimizer)
+        best_acc = -99999999
+        #get_accuracy(net, train_loader, loss_func)
+        #val_accuracy = validate(net, val_loader, loss_func)
+        #best_acc = val_accuracy[0]
+        #test(net, test_loader, loss_func)
+        #save_model_ori(args.model_ori, net, optimizer)
 
-        for epoch in range(100):
-            # if epoch%30 == 0:
-            #    optimizer.param_groups[0]['lr'] *= 0.9
-            train_fullprecision(net, train_loader, loss_func, optimizer, epoch)
-            val_accuracy = validate(net, val_loader, loss_func)
-            if val_accuracy[0] > best_acc:
-                best_acc = val_accuracy[0]
-                test(net, test_loader, loss_func)
-                save_model_ori(args.model_ori, net, optimizer)
+        for epoch in range(1,args.epochs+1):
+            #print("Started running epoch {} / {}".format(epoch,args.epochs))
 
-    # ALQ
-    if args.ALQ:
-        print('adaptive loss-aware quantization...')
-
-        net = ECGNet().cuda()
-        loss_func = torch.nn.CrossEntropyLoss().cuda()
-
-        print('loading pretrained full precision ECGNet model ...')
-        checkpoint = torch.load(args.model_ori)
-        net.load_state_dict(checkpoint['net_state_dict'])
-        for name, param in net.named_parameters():
-            print(name)
-            print(param.size())
-        print('initialization (structured sketching)...')
-        parameters_w, parameters_b, parameters_w_bin = initialize(
-            net, train_loader, loss_func, args.structure, args.subc, args.max_bit)
-        optimizer_b = torch.optim.Adam(parameters_b, weight_decay=args.wd)
-        optimizer_w = ALQ_optimizer(parameters_w, weight_decay=args.wd)
-        val_accuracy = validate(net, val_loader, loss_func)
-        best_acc = val_accuracy[0]
-        test(net, test_loader, loss_func)
-        save_model(args.model, net, optimizer_w, optimizer_b, parameters_w_bin)
-        # print(parameters_w)
-        # save_model_simple('./ALQ_in.pt',net)
-        num_training_sample = len(train_dataset)
-        M_p = (args.pr/args.top_k)/(args.epoch_prune *
-                                    math.ceil(num_training_sample/args.batch_size))
-
-        for r in range(args.R):
-
-            print('outer iteration: ', r)
-            optimizer_b.param_groups[0]['lr'] = args.lr
-            optimizer_w.param_groups[0]['lr'] = args.lr
-
-            print('optimizing basis...')
-            for q_epoch in range(args.epoch_basis):
-                optimizer_b.param_groups[0]['lr'] *= args.ld_basis
-                optimizer_w.param_groups[0]['lr'] *= args.ld_basis
-                train_basis(net, train_loader, loss_func, optimizer_w,
-                            optimizer_b, parameters_w_bin, q_epoch)
-                val_accuracy = validate(net, val_loader, loss_func)
-                if val_accuracy[0] > best_acc:
-                    best_acc = val_accuracy[0]
-                    test(net, test_loader, loss_func)
-                    #save_model(args.model, net, optimizer_w, optimizer_b, parameters_w_bin)
-
-            print('optimizing coordinates...')
-            for p_epoch in range(args.epoch_coord):
-                optimizer_b.param_groups[0]['lr'] *= args.ld_coord
-                optimizer_w.param_groups[0]['lr'] *= args.ld_coord
-                train_coordinate(net, train_loader, loss_func,
-                                 optimizer_w, optimizer_b, parameters_w_bin, p_epoch)
-                val_accuracy = validate(net, val_loader, loss_func)
-                if val_accuracy[0] > best_acc:
-                    best_acc = val_accuracy[0]
-                    test(net, test_loader, loss_func)
-                    #save_model(args.model, net, optimizer_w, optimizer_b, parameters_w_bin)
-
-            print('pruning...')
-            for t_epoch in range(args.epoch_prune):
-                prune(net, train_loader, loss_func, optimizer_w,
-                      optimizer_b, parameters_w_bin, [args.top_k, M_p], t_epoch)
-                val_accuracy = validate(net, val_loader, loss_func)
-                best_acc = val_accuracy[0]
-                test(net, test_loader, loss_func)
-                save_model(args.model, net, optimizer_w,
-                           optimizer_b, parameters_w_bin)
-        save_model_simple('./ECGNet_model_q_afterALQ.pt', net)
-        print(net.features[0].weight)
-        print(net.features[3].weight)
-        print(net.features[6].weight)
-        print(net.features[9].weight)
-        print(net.features[12].weight)
-        print(net.features[15].weight)
-        print(net.features[18].weight)
-        print(net.classifier[0].weight)
-        print(net.classifier[3].weight)
-        torch.save(net, 'a.pth')
-    if args.POSTTRAIN:
-        print('posttraining...')
-
-        net = ECGNet().cuda()
-        loss_func = torch.nn.CrossEntropyLoss().cuda()
-
-        parameters_w = []
-        parameters_b = []
-        for name, param in net.named_parameters():
-            if 'weight' in name and param.dim() > 1:
-                parameters_w.append(param)
+            if args.allow_detection and epoch > 35:
+                trustworthy_agents = args.agents - 1
             else:
-                parameters_b.append(param)
+                trustworthy_agents = args.agents
 
-        optimizer_b = torch.optim.Adam(parameters_b, weight_decay=args.wd)
-        optimizer_w = ALQ_optimizer(parameters_w, weight_decay=args.wd)
 
-        print('load quantized ECGNet model...')
-        checkpoint = torch.load(args.model)
-        net.load_state_dict(checkpoint['net_state_dict'])
-        optimizer_w.load_state_dict(checkpoint['optimizer_w_state_dict'])
-        optimizer_b.load_state_dict(checkpoint['optimizer_b_state_dict'])
-        for state in optimizer_b.state.values():
-            for k, v in state.items():
-                if torch.is_tensor(v):
-                    state[k] = v.cuda()
-        for state in optimizer_w.state.values():
-            for k, v in state.items():
-                if torch.is_tensor(v):
-                    state[k] = v.cuda()
+            if args.allow_detection and not cleared_models and epoch > 35:
+                print("Clearing models...")
+                cleared_models = True
+                for agent in range(args.agents):
+                    for p in dic["model{}".format(agent)].parameters():
+                        if p.requires_grad:
+                            p.data = torch.zeros(p.size())
 
-        num_weight_layer = 0.
-        num_bit_layer = 0.
-        print('currrent binary filter number per layer: ')
-        for p_w_bin in parameters_w_bin:
-            print(p_w_bin.num_bin_filter)
-        print('currrent average bitwidth per layer: ')
-        for p_w_bin in parameters_w_bin:
-            num_weight_layer += p_w_bin.num_weight
-            num_bit_layer += p_w_bin.avg_bit*p_w_bin.num_weight
-            print(p_w_bin.avg_bit)
-        print('currrent average bitwidth: ', num_bit_layer/num_weight_layer)
+            #Need to fill the joint model (net) with zeros
+            for p in net.parameters():
+                if p.requires_grad:
+                    p.data = torch.zeros(p.size())
 
-        get_accuracy(net, train_loader, loss_func)
-        val_accuracy = validate(net, val_loader, loss_func)
-        best_acc = val_accuracy[0]
-        test(net, test_loader, loss_func)
-        optimizer_b.param_groups[0]['lr'] = args.lr
-        optimizer_w.param_groups[0]['lr'] = args.lr
+            #Move everything from cpu to cuda
+            for l in layers_of_interest:
+                net.features[l].cuda()
+                for agent in range(args.agents):
+                    dic["model{}".format(agent)].features[l].cuda()
+            for l in classifier_layers_of_interest:
+                net.classifier[l].cuda()
+                for agent in range(args.agents):
+                    dic["model{}".format(agent)].classifier[l].cuda()
 
-        print('optimizing basis with STE...')
-        for epoch in range(50):
-            optimizer_b.param_groups[0]['lr'] *= 0.95
-            optimizer_w.param_groups[0]['lr'] *= 0.95
-            train_basis_STE(net, train_loader, loss_func,
-                            optimizer_w, optimizer_b, parameters_w_bin, epoch)
-            val_accuracy = validate(net, val_loader, loss_func)
+            #Train per agent
+            for agent in range(args.agents):
+                train_fullprecision(dic["model{}".format(agent)], train_loader, loss_func, dic["optimizer{}".format(agent)], epoch, agent, args.agents, trustworthy_agents, attack, args.attack_type, attacking_agent)
+
+            #Move everything from cpu to cuda - again
+            for l in layers_of_interest:
+                net.features[l].cuda()
+                for agent in range(args.agents):
+                    dic["model{}".format(agent)].features[l].cuda()
+            for l in classifier_layers_of_interest:
+                net.classifier[l].cuda()
+                for agent in range(args.agents):
+                    dic["model{}".format(agent)].classifier[l].cuda()
+
+            #Get all the data from the agents to the joint model
+            for l in layers_of_interest:
+                for agent in range(args.agents):
+                    if args.allow_detection and agent in attacking_agent and epoch > 35:
+                        continue
+                    net.features[l].weight.data += dic["model{}".format(agent)].features[l].weight.data / trustworthy_agents
+            for l in classifier_layers_of_interest:
+                for agent in range(args.agents):
+                    if args.allow_detection and agent in attacking_agent and epoch > 35:
+                        continue
+                    net.classifier[l].weight.data += dic["model{}".format(agent)].classifier[l].weight.data / trustworthy_agents
+
+            #Move everything from cpu to cuda - again
+            for l in layers_of_interest:
+                net.features[l].cuda()
+                for agent in range(args.agents):
+                    dic["model{}".format(agent)].features[l].cuda()
+
+            val_accuracy = validate(net, val_loader, loss_func, epoch, results_dic)
+            #test(net, test_loader, loss_func, epoch, results_dic)
+
+            #All agents get the joint model
+            for l in layers_of_interest:
+                for agent in range(args.agents):
+                    if agent in attacking_agent:
+                        continue
+                    dic["model{}".format(agent)].features[l].weight.data = net.features[l].weight.data.clone()
+            for l in classifier_layers_of_interest:
+                for agent in range(args.agents):
+                    if agent in attacking_agent:
+                        continue
+                    dic["model{}".format(agent)].classifier[l].weight.data = net.classifier[l].weight.data.clone()
+
+            #test(net, test_loader, loss_func, epoch, results_dic)
             if val_accuracy[0] > best_acc:
                 best_acc = val_accuracy[0]
-                test(net, test_loader, loss_func)
-                save_model(args.model, net, optimizer_w,
-                           optimizer_b, parameters_w_bin)
+                #print("Val Acc: {}".format(best_acc))
+            
+            if epoch % 100 == 0 or epoch == args.epochs:
+                print("Experiment {}: Finished Running epoch {}, printing results dictionary to file.".format(num_exp,epoch))
+                file_name = "{}/{}{}{}.json".format(args.output_dir,args.results_file,model_prefix,num_exp)
+                with open(file_name, "w") as fp:
+                    json.dump(results_dic, fp)
+                model_dir = args.output_dir + args.model_ori
+                save_model_ori(model_dir, net, optimizer)
 
-        print('optimizing coordinates...')
-        for epoch in range(20):
-            optimizer_b.param_groups[0]['lr'] *= 0.9
-            optimizer_w.param_groups[0]['lr'] *= 0.9
-            train_coordinate(net, train_loader, loss_func,
-                             optimizer_w, optimizer_b, parameters_w_bin, epoch)
-            val_accuracy = validate(net, val_loader, loss_func)
-            if val_accuracy[0] > best_acc:
-                best_acc = val_accuracy[0]
-                test(net, test_loader, loss_func)
-                save_model(args.model, net, optimizer_w,
-                           optimizer_b, parameters_w_bin)
-        save_model_simple('./ECGNet_model_q.pth', net)
-        torch.save(net, './test.pth')
+    ##### ALQ
+    ####if args.ALQ:
+    ####    print('adaptive loss-aware quantization...')
+
+    ####    net = ECGNet().cuda()
+    ####    loss_func = torch.nn.CrossEntropyLoss().cuda()
+
+    ####    print('loading pretrained full precision ECGNet model ...')
+    ####    checkpoint = torch.load(args.model_ori)
+    ####    net.load_state_dict(checkpoint['net_state_dict'])
+    ####    for name, param in net.named_parameters():
+    ####        print(name)
+    ####        print(param.size())
+    ####    print('initialization (structured sketching)...')
+    ####    parameters_w, parameters_b, parameters_w_bin = initialize(
+    ####        net, train_loader, loss_func, args.structure, args.subc, args.max_bit)
+    ####    optimizer_b = torch.optim.Adam(parameters_b, weight_decay=args.wd)
+    ####    optimizer_w = ALQ_optimizer(parameters_w, weight_decay=args.wd)
+    ####    val_accuracy = validate(net, val_loader, loss_func)
+    ####    best_acc = val_accuracy[0]
+    ####    test(net, test_loader, loss_func)
+    ####    save_model(args.model, net, optimizer_w, optimizer_b, parameters_w_bin)
+    ####    # print(parameters_w)
+    ####    # save_model_simple('./ALQ_in.pt',net)
+    ####    num_training_sample = len(train_dataset)
+    ####    M_p = (args.pr/args.top_k)/(args.epoch_prune *
+    ####                                math.ceil(num_training_sample/args.batch_size))
+
+    ####    for r in range(args.R):
+
+    ####        print('outer iteration: ', r)
+    ####        optimizer_b.param_groups[0]['lr'] = args.lr
+    ####        optimizer_w.param_groups[0]['lr'] = args.lr
+
+    ####        print('optimizing basis...')
+    ####        for q_epoch in range(args.epoch_basis):
+    ####            optimizer_b.param_groups[0]['lr'] *= args.ld_basis
+    ####            optimizer_w.param_groups[0]['lr'] *= args.ld_basis
+    ####            train_basis(net, train_loader, loss_func, optimizer_w,
+    ####                        optimizer_b, parameters_w_bin, q_epoch)
+    ####            val_accuracy = validate(net, val_loader, loss_func)
+    ####            if val_accuracy[0] > best_acc:
+    ####                best_acc = val_accuracy[0]
+    ####                test(net, test_loader, loss_func)
+    ####                #save_model(args.model, net, optimizer_w, optimizer_b, parameters_w_bin)
+
+    ####        print('optimizing coordinates...')
+    ####        for p_epoch in range(args.epoch_coord):
+    ####            optimizer_b.param_groups[0]['lr'] *= args.ld_coord
+    ####            optimizer_w.param_groups[0]['lr'] *= args.ld_coord
+    ####            train_coordinate(net, train_loader, loss_func,
+    ####                             optimizer_w, optimizer_b, parameters_w_bin, p_epoch)
+    ####            val_accuracy = validate(net, val_loader, loss_func)
+    ####            if val_accuracy[0] > best_acc:
+    ####                best_acc = val_accuracy[0]
+    ####                test(net, test_loader, loss_func)
+    ####                #save_model(args.model, net, optimizer_w, optimizer_b, parameters_w_bin)
+
+    ####        print('pruning...')
+    ####        for t_epoch in range(args.epoch_prune):
+    ####            prune(net, train_loader, loss_func, optimizer_w,
+    ####                  optimizer_b, parameters_w_bin, [args.top_k, M_p], t_epoch)
+    ####            val_accuracy = validate(net, val_loader, loss_func)
+    ####            best_acc = val_accuracy[0]
+    ####            test(net, test_loader, loss_func)
+    ####            save_model(args.model, net, optimizer_w,
+    ####                       optimizer_b, parameters_w_bin)
+    ####    save_model_simple('./ECGNet_model_q_afterALQ.pt', net)
+    ####    print(net.features[0].weight)
+    ####    print(net.features[3].weight)
+    ####    print(net.features[6].weight)
+    ####    print(net.features[9].weight)
+    ####    print(net.features[12].weight)
+    ####    print(net.features[15].weight)
+    ####    print(net.features[18].weight)
+    ####    print(net.classifier[0].weight)
+    ####    print(net.classifier[3].weight)
+    ####    torch.save(net, 'a.pth')
+    ####if args.POSTTRAIN:
+    ####    print('posttraining...')
+
+    ####    net = ECGNet().cuda()
+    ####    loss_func = torch.nn.CrossEntropyLoss().cuda()
+
+    ####    parameters_w = []
+    ####    parameters_b = []
+    ####    for name, param in net.named_parameters():
+    ####        if 'weight' in name and param.dim() > 1:
+    ####            parameters_w.append(param)
+    ####        else:
+    ####            parameters_b.append(param)
+
+    ####    optimizer_b = torch.optim.Adam(parameters_b, weight_decay=args.wd)
+    ####    optimizer_w = ALQ_optimizer(parameters_w, weight_decay=args.wd)
+
+    ####    print('load quantized ECGNet model...')
+    ####    checkpoint = torch.load(args.model)
+    ####    net.load_state_dict(checkpoint['net_state_dict'])
+    ####    optimizer_w.load_state_dict(checkpoint['optimizer_w_state_dict'])
+    ####    optimizer_b.load_state_dict(checkpoint['optimizer_b_state_dict'])
+    ####    for state in optimizer_b.state.values():
+    ####        for k, v in state.items():
+    ####            if torch.is_tensor(v):
+    ####                state[k] = v.cuda()
+    ####    for state in optimizer_w.state.values():
+    ####        for k, v in state.items():
+    ####            if torch.is_tensor(v):
+    ####                state[k] = v.cuda()
+
+    ####    num_weight_layer = 0.
+    ####    num_bit_layer = 0.
+    ####    print('currrent binary filter number per layer: ')
+    ####    for p_w_bin in parameters_w_bin:
+    ####        print(p_w_bin.num_bin_filter)
+    ####    print('currrent average bitwidth per layer: ')
+    ####    for p_w_bin in parameters_w_bin:
+    ####        num_weight_layer += p_w_bin.num_weight
+    ####        num_bit_layer += p_w_bin.avg_bit*p_w_bin.num_weight
+    ####        print(p_w_bin.avg_bit)
+    ####    print('currrent average bitwidth: ', num_bit_layer/num_weight_layer)
+
+    ####    get_accuracy(net, train_loader, loss_func)
+    ####    val_accuracy = validate(net, val_loader, loss_func)
+    ####    best_acc = val_accuracy[0]
+    ####    test(net, test_loader, loss_func)
+    ####    optimizer_b.param_groups[0]['lr'] = args.lr
+    ####    optimizer_w.param_groups[0]['lr'] = args.lr
+
+    ####    print('optimizing basis with STE...')
+    ####    for epoch in range(50):
+    ####        optimizer_b.param_groups[0]['lr'] *= 0.95
+    ####        optimizer_w.param_groups[0]['lr'] *= 0.95
+    ####        train_basis_STE(net, train_loader, loss_func,
+    ####                        optimizer_w, optimizer_b, parameters_w_bin, epoch)
+    ####        val_accuracy = validate(net, val_loader, loss_func)
+    ####        if val_accuracy[0] > best_acc:
+    ####            best_acc = val_accuracy[0]
+    ####            test(net, test_loader, loss_func)
+    ####            save_model(args.model, net, optimizer_w,
+    ####                       optimizer_b, parameters_w_bin)
+
+    ####    print('optimizing coordinates...')
+    ####    for epoch in range(20):
+    ####        optimizer_b.param_groups[0]['lr'] *= 0.9
+    ####        optimizer_w.param_groups[0]['lr'] *= 0.9
+    ####        train_coordinate(net, train_loader, loss_func,
+    ####                         optimizer_w, optimizer_b, parameters_w_bin, epoch)
+    ####        val_accuracy = validate(net, val_loader, loss_func)
+    ####        if val_accuracy[0] > best_acc:
+    ####            best_acc = val_accuracy[0]
+    ####            test(net, test_loader, loss_func)
+    ####            save_model(args.model, net, optimizer_w,
+    ####                       optimizer_b, parameters_w_bin)
+    ####    save_model_simple('./ECGNet_model_q.pth', net)
+    ####    torch.save(net, './test.pth')
